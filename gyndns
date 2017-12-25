@@ -1,0 +1,177 @@
+#!/bin/bash
+# 
+# Copyright 2015-present Patrice Jaton.
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# 
+# http://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# 
+# 
+# Script using Google's domain API to update a Dynamic DNS entry
+# see https://support.google.com/domains/answer/6147083?hl=en
+# 
+
+# Set up the default
+username=
+password=
+agent=domains.google.com
+hostname=**.hi-it.org
+ip=
+offline=
+verbose=
+
+function usage() { 
+    script=`basename $0`
+    echo "usage: $script -u username -p password -a agent [-i ipaddress | -o | -f] [-v] hostname";
+    echo "       $script -h";
+    echo "  -u username   The username associated with the host that is to be updated";
+    echo "  -p password   The password associated with the host that is to be updated";
+    echo "  -a agent      The required HTTP user-agent requesting the update";
+    echo "  -i ipaddress  The optional new IP address. If not specified, the IP of the";
+    echo "                agent sending the request will be used";
+    echo "  -o            Turn the dynamic hostname online";
+    echo "  -f            Turn the dynamic hostname offline";
+    echo "  -v            Verbose mode";
+    echo "  -h            Display this help"
+}
+
+function valid_ip()
+{
+    local ip=$1
+    local stat=1
+
+    if [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        OIFS=$IFS
+        IFS='.'
+        ip=($ip)
+        IFS=$OIFS
+        [[ ${ip[0]} -le 255 && ${ip[1]} -le 255 \
+            && ${ip[2]} -le 255 && ${ip[3]} -le 255 ]]
+        stat=$?
+    fi
+    return $stat
+}
+
+if [ $# -eq 0 ] ; then
+    usage
+    exit 0
+fi
+
+options=':u:p:a:n:i:hofv'
+while getopts $options option
+do
+    case $option in
+        u)    username=$OPTARG;;
+        p)    password=$OPTARG;;
+        a)    agent=$OPTARG;;
+        n)    hostname=$OPTARG;;
+        i)    
+            if [ -z "$offline" ]; then 
+                ip=$OPTARG; 
+                if (! valid_ip $ip); then
+                    echo "\"$ip\" is not a valid IPv4 address"
+                    exit 1
+                fi;
+            else 
+                echo "-i, -o and -f cannot be used together" >&2
+                usage >&2
+                exit 1
+            fi;;
+        o)    
+            if [ -z "$offline" ] && [ -z "$ip" ]; then 
+                offline=false
+            else 
+                echo "-i, -o and -f cannot be used together" >&2
+                usage >&2
+                exit 1
+            fi;;
+        f)    
+            if [ -z "$offline" ] && [ -z "$ip" ]; then 
+                offline=true
+            else 
+                echo "-i, -o and -f cannot be used together" >&2
+                usage >&2
+                exit 1
+            fi;;
+        v)    verbose="-v";;
+        h)    usage; exit;;
+        \?)   echo "unknown option: -$OPTARG" >&2; usage >&2; exit 1;;
+        :)    echo "missing argument for option: -$OPTARG" >&2; usage >&2; exit 1;;
+        *)    echo "unimplemented option: -$option" >&2; usage >&2; exit 1;;
+    esac
+done
+
+missings=()
+for argument_name in 'username' 'password' 'agent' 'hostname'
+do
+    eval argument_value=\$$argument_name
+    if [ -z "$argument_value" ]; then
+        missings+=($argument_name)
+    fi
+done
+
+shift $(($OPTIND - 1))
+
+if [ ! ${#missings[@]} -eq 0 ]; then
+    echo "missing: ${missings[*]}" >&2
+    usage >&2
+    exit 1
+fi
+
+queryString="hostname=$hostname"
+if [ -n "$ip" ]; then
+    queryString+="&myip=$ip" 
+fi
+if [ -n "$offline" ]; then
+    if ($offline); then
+        queryString+="&offline=yes"
+    else
+        queryString+="&offline=no"
+    fi 
+fi
+
+status=`curl -s $verbose -H "User-Agent: $agent" --user $username:$password https://domains.google.com/nic/update?$queryString >&1`
+case $status in
+    nohost)   echo "The hostname \"$hostname\" does not exist, or does not have Dynamic DNS enabled." >&2; exit 1;;
+    badauth)  echo "The username / password combination is not valid for the specified host." >&2; exit 1;;
+    notfqdn)  echo "The supplied hostname \"$hostname\" is not a valid fully-qualified domain name." >&2; exit 1;;
+    badagent) 
+        if [ -n "$ip"]; then
+            echo "Either the agent \"$agent\" is invalid or the IP address \"$ip\" is not a valid IPv4 address." >&2
+            exit 1
+        else
+            echo "The agent \"$agent\" is invalid." >&2
+            exit 1
+        fi;;
+    abuse)    echo "Dynamic DNS access for the hostname has been blocked due to failure to interpret previous responses correctly." >&2; exit 1;;
+    911)      echo "An error happened on our end. Wait 5 minutes and retry." >&2; exit 1;;
+    good*)
+        if [ ! -z "$offline" ]; then
+            if ($offline); then
+                echo "The dynamic DNS for \"$hostname\" is now offline."
+            else
+                echo "The dynamic DNS for \"$hostname\" is back online and set to ${status#good }."
+            fi 
+        else
+            echo "The dynamic DNS for \"$hostname\" is now set to ${status#good }."
+        fi;;
+    nochg*)
+        if [ ! -z "$offline" ]; then
+            if ($offline); then
+                echo "The dynamic DNS for \"$hostname\" was not change and remains offline."
+            else
+                echo "The dynamic DNS for \"$hostname\" was not change and remains online set to ${status#nochg }."
+            fi 
+        else
+            echo "The dynamic DNS for \"$hostname\" was not changed and remains set to ${status#nochg }."
+        fi;;
+    *)        echo "Unexpected response \"$status\" from the server!"; exit 1;;
+esac
